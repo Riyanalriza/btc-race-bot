@@ -11,6 +11,11 @@
 //     it buys and holds with a wide stop (-200 bps from entry) and take-profit (+300 bps).
 //     This only exists so a monotonic uptrend day cannot leave the bot with zero trades.
 //     On the dev window it never fires: the mean-reversion leg trades first.
+//   * Circuit breaker — equity drawdown guard: if equity (cash + position at the
+//     latest close, as reported by the harness) falls more than 10% below its peak,
+//     flatten any position and stop trading for the rest of the window. On the dev
+//     window it never fires (max drawdown 0.91%), so it changes nothing there; it
+//     exists so a steep downtrend day cannot bleed the whole account.
 //
 // All decisions are integer (BigInt) arithmetic on the bars the harness sends; no wall clock,
 // no environment, no randomness, so two runs on the same data give the same action log.
@@ -27,12 +32,15 @@ const INS_MOM_BPS = 80; // insurance entry: 240-bar return above this (bps)
 const INS_SL_BPS = 200; // insurance stop: this far below entry (bps)
 const INS_TP_BPS = 300; // insurance take-profit: this far above entry (bps)
 const MAX_SLIP_BPS = 100; // max slippage on every order (bps from the latest close)
+const CB_MAX_DD_BPS = 1000; // circuit breaker: stop trading after a 10% equity drawdown from peak
 
 // Closes seen so far, oldest first (warm-up bars included: they build history, never trade).
 const closes: bigint[] = [];
 let entry = 0n;
 let leg: 'mr' | 'ins' | null = null;
 let everHeld = false;
+let peak = 0n; // highest equity (quote units) seen on a scored batch
+let tripped = false; // circuit breaker latched: flatten once, then never trade again
 
 function sma(): bigint | null {
   if (closes.length < SMA_N) return null;
@@ -53,6 +61,15 @@ await runBars({
     if (mean === null) return [];
     const held = state.positions.get(SYM)?.qty ?? 0n;
     if (held > 0n) everHeld = true;
+    // Circuit breaker: track the equity peak, trip on a >10% drawdown from it.
+    if (peak === 0n || state.equity > peak) peak = state.equity;
+    if (tripped || state.equity * 10000n < peak * BigInt(10000 - CB_MAX_DD_BPS)) {
+      tripped = true;
+      if (held > 0n) {
+        return [{ side: 'sell', symbol: SYM, qty: held, max_slippage_bps: MAX_SLIP_BPS }];
+      }
+      return [];
+    }
     // Deviation of the latest close from the slow mean, in bps (integer, truncating).
     const dev = (close * 10000n) / mean - 10000n;
     if (held === 0n) {
